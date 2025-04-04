@@ -24,4 +24,3 @@ The application uses the following database schema:
 ## Setup
 
 1. Create a virtual environment:
-

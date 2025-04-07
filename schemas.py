@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import date, datetime
 
@@ -26,14 +26,12 @@ class User(UserBase):
     created_at: datetime
     deleted_at: Optional[datetime] = None
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 class UserWithRegions(User):
     regions: List["Region"]
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # Region schemas
 class RegionBase(BaseModel):
@@ -51,8 +49,7 @@ class Region(RegionBase):
     id: int
     deleted_at: Optional[datetime] = None
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # Authority schemas
 class AuthorityBase(BaseModel):
@@ -65,8 +62,7 @@ class Authority(AuthorityBase):
     id: int
     deleted_at: Optional[datetime] = None
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # Status schemas
 class StatusBase(BaseModel):
@@ -79,8 +75,7 @@ class Status(StatusBase):
     id: int
     deleted_at: Optional[datetime] = None
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # Project schemas
 class ProjectBase(BaseModel):
@@ -112,16 +107,14 @@ class Project(ProjectBase):
     id: int
     deleted_at: Optional[datetime] = None
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ProjectDetail(Project):
     region: Region
     authority: Authority
     status: Status
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # New schema for project filtering response
 class ProjectFilterResponse(BaseModel):

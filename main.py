@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
 from typing import List, Optional, Dict, Any
-from datetime import timedelta
+from datetime import timedelta, datetime
 import io
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill
@@ -14,6 +14,7 @@ from fastapi.routing import APIRouter
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 import logging
+from pydantic import BaseModel
 
 import models
 import schemas
@@ -30,6 +31,7 @@ from auth import (
     conditional_auth
 )
 from data_initializer import initialize_database
+from logging_config import RequestLoggingMiddleware
 
 # Configure logging to reduce noise from invalid HTTP requests
 logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
@@ -38,23 +40,58 @@ logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 # Create database tables
 models.Base.metadata.create_all(bind=engine)
 
-# Create FastAPI app with docs disabled (we'll create custom routes)
+# Replace the FastAPI app initialization with this:
 app = FastAPI(
     title="Project Management API",
     description="API for managing regional projects with user authentication",
     version="1.0.0",
-    docs_url=None,  # Disable default docs
-    redoc_url=None  # Disable default redoc
+    # Enable default docs endpoints
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
+
+# Add this function to the main.py file, right after the imports
+@app.middleware("http")
+async def debug_request(request: Request, call_next):
+    # Log request details for debugging
+    print(f"Request path: {request.url.path}")
+    print(f"Request method: {request.method}")
+    print(f"Request headers: {request.headers}")
+    
+    # Continue processing the request
+    response = await call_next(request)
+    return response
+
+# Also modify the trailing slash middleware to exclude docs endpoints:
+@app.middleware("http")
+async def add_trailing_slash(request: Request, call_next):
+    """Middleware to add trailing slash to URLs that don't have one."""
+    path = request.url.path
+    
+    # Skip for static files, docs endpoints, and paths that already have a trailing slash
+    if path.endswith('/') or path.startswith('/static/') or path == '/docs' or path == '/redoc' or path == '/openapi.json':
+        return await call_next(request)
+    
+    # For API endpoints that should have a trailing slash
+    if path.startswith('/users') or path.startswith('/regions') or path.startswith('/projects') or \
+       path.startswith('/authorities') or path.startswith('/statuses'):
+        # Redirect to the same path with a trailing slash
+        return Response(status_code=307, headers={"Location": f"{path}/"})
+    
+    return await call_next(request)
 
 # Add CORS middleware
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+  CORSMiddleware,
+  allow_origins=["http://localhost:5173", "https://alpamis.space", "https://www.alpamis.space"],  # List specific origins instead of "*"
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
+  expose_headers=["Authorization"],
 )
+
+# Add RequestLoggingMiddleware
+app.add_middleware(RequestLoggingMiddleware)
 
 # Create routers for different categories
 auth_router = APIRouter(tags=["Authentication"])
@@ -69,28 +106,61 @@ statuses_router = APIRouter(tags=["Status Management"])
 async def health_check():
     return {"status": "healthy"}
 
+# Add new endpoint to check API status
+@app.get("/api-status", tags=["Status"])
+async def api_status():
+    return {
+        "status": "online",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 # Handle OPTIONS requests explicitly to prevent invalid HTTP request warnings
 @app.options("/{path:path}")
 async def options_handler(request: Request, path: str):
     return Response(status_code=200)
 
-# Custom documentation routes that don't rely on CORS
-@app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html():
-    return get_swagger_ui_html(
-        openapi_url="/openapi.json",
-        title=app.title + " - Swagger UI",
-        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
-        swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
-    )
+# Remove or comment out the custom documentation routes:
+# @app.get("/docs", include_in_schema=False)
+# async def custom_swagger_ui_html():
+#     return get_swagger_ui_html(
+#         openapi_url="/openapi.json",
+#         title=app.title + " - Swagger UI",
+#         swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
+#         swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
+#     )
 
-@app.get("/redoc", include_in_schema=False)
-async def redoc_html():
-    return get_redoc_html(
-        openapi_url="/openapi.json",
-        title=app.title + " - ReDoc",
-        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
+# @app.get("/redoc", include_in_schema=False)
+# async def redoc_html():
+#     return get_redoc_html(
+#         openapi_url="/openapi.json",
+#         title=app.title + " - ReDoc",
+#         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
+#     )
+
+# Define a model for JSON login
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# Add a new JSON-based login endpoint
+@auth_router.post("/login", response_model=schemas.Token)
+async def login_json(
+    login_data: LoginRequest,
+    db: Session = Depends(get_db)
+):
+    user = authenticate_user(db, login_data.username, login_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
     )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 # Authentication endpoints
 @auth_router.post("/token", response_model=schemas.Token)
@@ -169,6 +239,26 @@ async def create_user(
     db.commit()
     db.refresh(db_user)
     return db_user
+
+# User profile endpoint - always requires authentication
+@users_router.get("/users/me/", response_model=schemas.UserWithRegions)
+async def read_users_me(current_user: models.User = Depends(get_current_active_user)):
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required for user data"
+        )
+    return current_user
+
+@users_router.get("/users/me/regions/", response_model=List[schemas.Region])
+async def read_users_regions(current_user: models.User = Depends(get_current_active_user)):
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required for user data"
+        )
+    # Filter out deleted regions
+    return [region for region in current_user.regions if region.deleted_at is None]
 
 @users_router.get("/users/", response_model=List[schemas.UserWithRegions])
 async def read_users(
@@ -342,26 +432,6 @@ async def update_user_regions(
     db.refresh(db_user)
     return db_user
 
-# User profile endpoint
-@users_router.get("/users/me/", response_model=schemas.UserWithRegions)
-async def read_users_me(current_user: models.User = Depends(get_current_active_user)):
-    if current_user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required for user data"
-        )
-    return current_user
-
-@users_router.get("/users/me/regions/", response_model=List[schemas.Region])
-async def read_users_regions(current_user: models.User = Depends(get_current_active_user)):
-    if current_user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required for user data"
-        )
-    # Filter out deleted regions
-    return [region for region in current_user.regions if region.deleted_at is None]
-
 # Region endpoints
 @regions_router.post("/regions/", response_model=schemas.Region)
 async def create_region(
@@ -389,6 +459,7 @@ async def create_region(
     db.refresh(db_region)
     return db_region
 
+# Update the read_regions function to handle None current_user
 @regions_router.get("/regions/", response_model=List[schemas.Region])
 async def read_regions(
     include_deleted: bool = False,
@@ -402,6 +473,7 @@ async def read_regions(
     regions = query.all()
     return regions
 
+# Update the read_region function to handle None current_user
 @regions_router.get("/regions/{region_id}", response_model=schemas.Region)
 async def read_region(
     region_id: int,
@@ -519,48 +591,117 @@ async def restore_region(
 # Project management endpoints
 @projects_router.post("/projects/", response_model=schemas.Project)
 async def create_project(
-    project: schemas.ProjectCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user)
+  project: schemas.ProjectCreate,
+  db: Session = Depends(get_db),
+  current_user: models.User = Depends(get_current_active_user)
 ):
-    # Check if user has access to the region
-    if not check_region_access(current_user, project.region_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to create projects in this region"
-        )
-    
-    # Check if region exists
-    region = db.query(models.Region).filter(
-        models.Region.id == project.region_id,
-        models.Region.deleted_at == None
-    ).first()
-    if not region:
-        raise HTTPException(status_code=404, detail="Region not found")
-    
-    # Check if authority exists
-    authority = db.query(models.Authority).filter(
-        models.Authority.id == project.authority_id,
-        models.Authority.deleted_at == None
-    ).first()
-    if not authority:
-        raise HTTPException(status_code=404, detail="Authority not found")
-    
-    # Check if status exists
-    status = db.query(models.Status).filter(
-        models.Status.id == project.status_id,
-        models.Status.deleted_at == None
-    ).first()
-    if not status:
-        raise HTTPException(status_code=404, detail="Status not found")
-    
-    # Create project
-    db_project = models.Project(**project.dict())
-    db.add(db_project)
-    db.commit()
-    db.refresh(db_project)
-    return db_project
+  # Check if user is authenticated
+  if current_user is None:
+      raise HTTPException(
+          status_code=status.HTTP_401_UNAUTHORIZED,
+          detail="Authentication required",
+          headers={"WWW-Authenticate": "Bearer"},
+      )
+  
+  # Check if user has access to the region
+  if not check_region_access(current_user, project.region_id):
+      raise HTTPException(
+          status_code=status.HTTP_403_FORBIDDEN,
+          detail="Not authorized to create projects in this region"
+      )
+  
+  # Check if region exists
+  region = db.query(models.Region).filter(
+      models.Region.id == project.region_id,
+      models.Region.deleted_at == None
+  ).first()
+  if not region:
+      raise HTTPException(status_code=404, detail="Region not found")
+  
+  # Check if authority exists
+  authority = db.query(models.Authority).filter(
+      models.Authority.id == project.authority_id,
+      models.Authority.deleted_at == None
+  ).first()
+  if not authority:
+      raise HTTPException(status_code=404, detail="Authority not found")
+  
+  # Check if status exists
+  status = db.query(models.Status).filter(
+      models.Status.id == project.status_id,
+      models.Status.deleted_at == None
+  ).first()
+  if not status:
+      raise HTTPException(status_code=404, detail="Status not found")
+  
+  try:
+      # Create project
+      db_project = models.Project(**project.dict())
+      db.add(db_project)
+      db.commit()
+      db.refresh(db_project)
+      return db_project
+  except Exception as e:
+      db.rollback()
+      raise HTTPException(
+          status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+          detail=f"Error creating project: {str(e)}"
+      )
 
+# Add this route to handle requests without trailing slash
+@app.post("/projects", include_in_schema=False)
+async def create_project_redirect():
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": "/projects/"})
+
+# Add redirects for POST requests without trailing slashes
+@app.post("/users", include_in_schema=False)
+async def create_user_redirect():
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": "/users/"})
+
+@app.post("/regions", include_in_schema=False)
+async def create_region_redirect():
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": "/regions/"})
+
+@app.post("/authorities", include_in_schema=False)
+async def create_authority_redirect():
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": "/authorities/"})
+
+@app.post("/statuses", include_in_schema=False)
+async def create_status_redirect():
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": "/statuses/"})
+
+# Add similar redirects for PUT and DELETE methods
+@app.put("/users/{user_id}", include_in_schema=False)
+async def update_user_redirect(user_id: int):
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": f"/users/{user_id}/"})
+
+@app.put("/regions/{region_id}", include_in_schema=False)
+async def update_region_redirect(region_id: int):
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": f"/regions/{region_id}/"})
+
+@app.put("/projects/{project_id}", include_in_schema=False)
+async def update_project_redirect(project_id: int):
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": f"/projects/{project_id}/"})
+
+@app.put("/authorities/{authority_id}", include_in_schema=False)
+async def update_authority_redirect(authority_id: int):
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": f"/authorities/{authority_id}/"})
+
+@app.put("/statuses/{status_id}", include_in_schema=False)
+async def update_status_redirect(status_id: int):
+    # Redirect to the correct endpoint with trailing slash
+    return Response(status_code=307, headers={"Location": f"/statuses/{status_id}/"})
+
+# Update the read_projects function to handle None current_user
 @projects_router.get("/projects/", response_model=List[schemas.Project])
 async def read_projects(
     region_id: Optional[int] = None,
@@ -733,24 +874,6 @@ async def export_projects_to_excel(
             
             query = query.filter(models.Project.region_id.in_(accessible_region_ids))
     
-    # Apply budget filters
-    if budget_min is not None:
-        query = query.filter(models.Project.budget_million >= budget_min)
-    if budget_max is not None:
-        query = query.filter(models.Project.budget_million <= budget_max)
-    
-    # Apply status filter
-    if status_id is not None:
-        query = query.filter(models.Project.status_id == status_id)
-    
-    # Apply initiator (responsible person) filter
-    if initiator is not None:
-        query = query.filter(models.Project.initiator.ilike(f"%{initiator}%"))
-    
-    # Apply name filter
-    if name is not None:
-        query = query.filter(models.Project.name.ilike(f"%{name}%"))
-    
     # Get all projects with their related data
     projects = query.all()
     
@@ -806,6 +929,7 @@ async def export_projects_to_excel(
     }
     return Response(content=output.getvalue(), headers=headers)
 
+# Update the read_project function to handle None current_user
 @projects_router.get("/projects/{project_id}", response_model=schemas.ProjectDetail)
 async def read_project(
     project_id: int,
@@ -995,6 +1119,7 @@ async def create_authority(
     db.refresh(db_authority)
     return db_authority
 
+# Update the read_authorities function to handle None current_user
 @authorities_router.get("/authorities/", response_model=List[schemas.Authority])
 async def read_authorities(
     include_deleted: bool = False,
@@ -1008,6 +1133,7 @@ async def read_authorities(
     authorities = query.all()
     return authorities
 
+# Update the read_authority function to handle None current_user
 @authorities_router.get("/authorities/{authority_id}", response_model=schemas.Authority)
 async def read_authority(
     authority_id: int,
@@ -1129,6 +1255,7 @@ async def create_status(
     db.refresh(db_status)
     return db_status
 
+# Update the read_statuses function to handle None current_user
 @statuses_router.get("/statuses/", response_model=List[schemas.Status])
 async def read_statuses(
     include_deleted: bool = False,
@@ -1142,6 +1269,7 @@ async def read_statuses(
     statuses = query.all()
     return statuses
 
+# Update the read_status function to handle None current_user
 @statuses_router.get("/statuses/{status_id}", response_model=schemas.Status)
 async def read_status(
     status_id: int,

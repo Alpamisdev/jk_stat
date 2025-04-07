@@ -62,22 +62,48 @@ async def debug_request(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# Also modify the trailing slash middleware to exclude docs endpoints:
+# Modified trailing slash middleware to be more flexible
 @app.middleware("http")
-async def add_trailing_slash(request: Request, call_next):
-    """Middleware to add trailing slash to URLs that don't have one."""
+async def handle_trailing_slash(request: Request, call_next):
+    """Middleware to handle trailing slashes in URLs."""
     path = request.url.path
     
-    # Skip for static files, docs endpoints, and paths that already have a trailing slash
-    if path.endswith('/') or path.startswith('/static/') or path == '/docs' or path == '/redoc' or path == '/openapi.json':
+    # Skip for static files, docs endpoints, and OpenAPI endpoints
+    if path.startswith('/static/') or path in ['/docs', '/redoc', '/openapi.json']:
         return await call_next(request)
     
-    # For API endpoints that should have a trailing slash
-    if path.startswith('/users') or path.startswith('/regions') or path.startswith('/projects') or \
-       path.startswith('/authorities') or path.startswith('/statuses'):
-        # Redirect to the same path with a trailing slash
-        return Response(status_code=307, headers={"Location": f"{path}/"})
+    # For API endpoints, be more flexible with trailing slashes
+    # Instead of redirecting, try to match both with and without trailing slash
+    if path.endswith('/') and request.method in ['PUT', 'PATCH', 'DELETE', 'POST']:
+        # For these methods, try without trailing slash first
+        original_path = path
+        request.scope["path"] = path.rstrip('/')
+        try:
+            response = await call_next(request)
+            if response.status_code != 404:
+                return response
+            # If 404, restore original path and continue
+            request.scope["path"] = original_path
+        except Exception:
+            # If error, restore original path and continue
+            request.scope["path"] = original_path
     
+    # For paths without trailing slash, try with trailing slash for GET requests
+    elif not path.endswith('/') and request.method == 'GET':
+        # For GET, try with trailing slash first
+        original_path = path
+        request.scope["path"] = f"{path}/"
+        try:
+            response = await call_next(request)
+            if response.status_code != 404:
+                return response
+            # If 404, restore original path and continue
+            request.scope["path"] = original_path
+        except Exception:
+            # If error, restore original path and continue
+            request.scope["path"] = original_path
+    
+    # Continue with normal processing
     return await call_next(request)
 
 # Add CORS middleware
@@ -119,24 +145,6 @@ async def api_status():
 @app.options("/{path:path}")
 async def options_handler(request: Request, path: str):
     return Response(status_code=200)
-
-# Remove or comment out the custom documentation routes:
-# @app.get("/docs", include_in_schema=False)
-# async def custom_swagger_ui_html():
-#     return get_swagger_ui_html(
-#         openapi_url="/openapi.json",
-#         title=app.title + " - Swagger UI",
-#         swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
-#         swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
-#     )
-
-# @app.get("/redoc", include_in_schema=False)
-# async def redoc_html():
-#     return get_redoc_html(
-#         openapi_url="/openapi.json",
-#         title=app.title + " - ReDoc",
-#         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
-#     )
 
 # Define a model for JSON login
 class LoginRequest(BaseModel):
@@ -182,6 +190,7 @@ async def login_for_access_token(
     return {"access_token": access_token, "token_type": "bearer"}
 
 # User management endpoints (superadmin only)
+@users_router.post("/users", response_model=schemas.User)
 @users_router.post("/users/", response_model=schemas.User)
 async def create_user(
     user: schemas.UserCreate,
@@ -241,6 +250,7 @@ async def create_user(
     return db_user
 
 # User profile endpoint - always requires authentication
+@users_router.get("/users/me", response_model=schemas.UserWithRegions)
 @users_router.get("/users/me/", response_model=schemas.UserWithRegions)
 async def read_users_me(current_user: models.User = Depends(get_current_active_user)):
     if current_user is None:
@@ -250,6 +260,7 @@ async def read_users_me(current_user: models.User = Depends(get_current_active_u
         )
     return current_user
 
+@users_router.get("/users/me/regions", response_model=List[schemas.Region])
 @users_router.get("/users/me/regions/", response_model=List[schemas.Region])
 async def read_users_regions(current_user: models.User = Depends(get_current_active_user)):
     if current_user is None:
@@ -260,6 +271,7 @@ async def read_users_regions(current_user: models.User = Depends(get_current_act
     # Filter out deleted regions
     return [region for region in current_user.regions if region.deleted_at is None]
 
+@users_router.get("/users", response_model=List[schemas.UserWithRegions])
 @users_router.get("/users/", response_model=List[schemas.UserWithRegions])
 async def read_users(
     include_deleted: bool = False,
@@ -316,7 +328,9 @@ async def read_user(
         raise HTTPException(status_code=404, detail="User not found")
     return db_user
 
+# Support both with and without trailing slash for PUT
 @users_router.put("/users/{user_id}", response_model=schemas.User)
+@users_router.put("/users/{user_id}/", response_model=schemas.User)
 async def update_user(
     user_id: int,
     user_update: schemas.UserUpdate,
@@ -353,7 +367,20 @@ async def update_user(
     db.refresh(db_user)
     return db_user
 
+# Add PATCH method for partial updates
+@users_router.patch("/users/{user_id}", response_model=schemas.User)
+@users_router.patch("/users/{user_id}/", response_model=schemas.User)
+async def patch_user(
+    user_id: int,
+    user_update: schemas.UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_superadmin)
+):
+    # Reuse the same implementation as PUT
+    return await update_user(user_id, user_update, db, current_user)
+
 @users_router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@users_router.delete("/users/{user_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
@@ -396,6 +423,7 @@ async def restore_user(
 
 # User-Region management (superadmin only)
 @users_router.put("/users/{user_id}/regions", response_model=schemas.UserWithRegions)
+@users_router.put("/users/{user_id}/regions/", response_model=schemas.UserWithRegions)
 async def update_user_regions(
     user_id: int,
     region_update: schemas.UserRegionUpdate,
@@ -433,6 +461,7 @@ async def update_user_regions(
     return db_user
 
 # Region endpoints
+@regions_router.post("/regions", response_model=schemas.Region)
 @regions_router.post("/regions/", response_model=schemas.Region)
 async def create_region(
     region: schemas.RegionCreate,
@@ -460,6 +489,7 @@ async def create_region(
     return db_region
 
 # Update the read_regions function to handle None current_user
+@regions_router.get("/regions", response_model=List[schemas.Region])
 @regions_router.get("/regions/", response_model=List[schemas.Region])
 async def read_regions(
     include_deleted: bool = False,
@@ -492,6 +522,7 @@ async def read_region(
     return db_region
 
 @regions_router.put("/regions/{region_id}", response_model=schemas.Region)
+@regions_router.put("/regions/{region_id}/", response_model=schemas.Region)
 async def update_region(
     region_id: int,
     region_update: schemas.RegionUpdate,
@@ -539,7 +570,20 @@ async def update_region(
     db.refresh(db_region)
     return db_region
 
+# Add PATCH method for partial updates
+@regions_router.patch("/regions/{region_id}", response_model=schemas.Region)
+@regions_router.patch("/regions/{region_id}/", response_model=schemas.Region)
+async def patch_region(
+    region_id: int,
+    region_update: schemas.RegionUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    # Reuse the same implementation as PUT
+    return await update_region(region_id, region_update, db, current_user)
+
 @regions_router.delete("/regions/{region_id}", status_code=status.HTTP_204_NO_CONTENT)
+@regions_router.delete("/regions/{region_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_region(
     region_id: int,
     db: Session = Depends(get_db),
@@ -589,6 +633,7 @@ async def restore_region(
     return db_region
 
 # Project management endpoints
+@projects_router.post("/projects", response_model=schemas.Project)
 @projects_router.post("/projects/", response_model=schemas.Project)
 async def create_project(
   project: schemas.ProjectCreate,
@@ -648,60 +693,8 @@ async def create_project(
           detail=f"Error creating project: {str(e)}"
       )
 
-# Add this route to handle requests without trailing slash
-@app.post("/projects", include_in_schema=False)
-async def create_project_redirect():
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": "/projects/"})
-
-# Add redirects for POST requests without trailing slashes
-@app.post("/users", include_in_schema=False)
-async def create_user_redirect():
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": "/users/"})
-
-@app.post("/regions", include_in_schema=False)
-async def create_region_redirect():
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": "/regions/"})
-
-@app.post("/authorities", include_in_schema=False)
-async def create_authority_redirect():
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": "/authorities/"})
-
-@app.post("/statuses", include_in_schema=False)
-async def create_status_redirect():
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": "/statuses/"})
-
-# Add similar redirects for PUT and DELETE methods
-@app.put("/users/{user_id}", include_in_schema=False)
-async def update_user_redirect(user_id: int):
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": f"/users/{user_id}/"})
-
-@app.put("/regions/{region_id}", include_in_schema=False)
-async def update_region_redirect(region_id: int):
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": f"/regions/{region_id}/"})
-
-@app.put("/projects/{project_id}", include_in_schema=False)
-async def update_project_redirect(project_id: int):
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": f"/projects/{project_id}/"})
-
-@app.put("/authorities/{authority_id}", include_in_schema=False)
-async def update_authority_redirect(authority_id: int):
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": f"/authorities/{authority_id}/"})
-
-@app.put("/statuses/{status_id}", include_in_schema=False)
-async def update_status_redirect(status_id: int):
-    # Redirect to the correct endpoint with trailing slash
-    return Response(status_code=307, headers={"Location": f"/statuses/{status_id}/"})
-
 # Update the read_projects function to handle None current_user
+@projects_router.get("/projects", response_model=List[schemas.Project])
 @projects_router.get("/projects/", response_model=List[schemas.Project])
 async def read_projects(
     region_id: Optional[int] = None,
@@ -715,14 +708,20 @@ async def read_projects(
     # Filter by region if specified
     if region_id is not None:
         # For authenticated users, check region access
-        if current_user is not None and not check_region_access(current_user, region_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to view projects in this region"
-            )
+        if current_user is not None and not current_user.is_superadmin:
+            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+            if region_id not in accessible_region_ids:
+                # For authenticated users without access, return 403
+                # For unauthenticated users, just filter by the requested region
+                if current_user is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Not authorized to view projects in this region"
+                    )
         query = query.filter(models.Project.region_id == region_id)
     else:
-        # If no region specified and user is authenticated, only show projects from regions they have access to
+        # If no region specified and user is authenticated but not superadmin, 
+        # only show projects from regions they have access to
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if not accessible_region_ids:
@@ -754,14 +753,21 @@ async def filter_projects(
     
     # Apply region filter and check access for authenticated users
     if region_id is not None:
-        if current_user is not None and not check_region_access(current_user, region_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to view projects in this region"
-            )
+        # For authenticated users, check region access
+        if current_user is not None and not current_user.is_superadmin:
+            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+            if region_id not in accessible_region_ids:
+                # For authenticated users without access, return 403
+                # For unauthenticated users, just filter by the requested region
+                if current_user is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Not authorized to view projects in this region"
+                    )
         query = query.filter(models.Project.region_id == region_id)
     else:
-        # If no region specified and user is authenticated, only show projects from regions they have access to
+        # If no region specified and user is authenticated but not superadmin,
+        # only show projects from regions they have access to
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if not accessible_region_ids:
@@ -846,14 +852,21 @@ async def export_projects_to_excel(
     
     # Apply region filter and check access for authenticated users
     if region_id is not None:
-        if current_user is not None and not check_region_access(current_user, region_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to export projects in this region"
-            )
+        # For authenticated users, check region access
+        if current_user is not None and not current_user.is_superadmin:
+            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+            if region_id not in accessible_region_ids:
+                # For authenticated users without access, return 403
+                # For unauthenticated users, just filter by the requested region
+                if current_user is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Not authorized to export projects in this region"
+                    )
         query = query.filter(models.Project.region_id == region_id)
     else:
-        # If no region specified and user is authenticated, only show projects from regions they have access to
+        # If no region specified and user is authenticated but not superadmin,
+        # only show projects from regions they have access to
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if not accessible_region_ids:
@@ -949,15 +962,18 @@ async def read_project(
         raise HTTPException(status_code=404, detail="Project not found")
     
     # Check if authenticated user has access to the project's region
-    if current_user is not None and not check_region_access(current_user, project.region_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view this project"
-        )
+    # For unauthenticated users, allow access to all projects
+    if current_user is not None and not current_user.is_superadmin:
+        if not check_region_access(current_user, project.region_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to view this project"
+            )
     
     return project
 
 @projects_router.put("/projects/{project_id}", response_model=schemas.Project)
+@projects_router.put("/projects/{project_id}/", response_model=schemas.Project)
 async def update_project(
     project_id: int,
     project_update: schemas.ProjectUpdate,
@@ -1043,7 +1059,20 @@ async def update_project(
     db.refresh(project)
     return project
 
+# Add PATCH method for partial updates
+@projects_router.patch("/projects/{project_id}", response_model=schemas.Project)
+@projects_router.patch("/projects/{project_id}/", response_model=schemas.Project)
+async def patch_project(
+    project_id: int,
+    project_update: schemas.ProjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    # Reuse the same implementation as PUT
+    return await update_project(project_id, project_update, db, current_user)
+
 @projects_router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+@projects_router.delete("/projects/{project_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project(
     project_id: int,
     db: Session = Depends(get_db),
@@ -1094,6 +1123,7 @@ async def restore_project(
     return project
 
 # Authority endpoints - Restored
+@authorities_router.post("/authorities", response_model=schemas.Authority)
 @authorities_router.post("/authorities/", response_model=schemas.Authority)
 async def create_authority(
     authority: schemas.AuthorityCreate,
@@ -1120,6 +1150,7 @@ async def create_authority(
     return db_authority
 
 # Update the read_authorities function to handle None current_user
+@authorities_router.get("/authorities", response_model=List[schemas.Authority])
 @authorities_router.get("/authorities/", response_model=List[schemas.Authority])
 async def read_authorities(
     include_deleted: bool = False,
@@ -1152,6 +1183,7 @@ async def read_authority(
     return db_authority
 
 @authorities_router.put("/authorities/{authority_id}", response_model=schemas.Authority)
+@authorities_router.put("/authorities/{authority_id}/", response_model=schemas.Authority)
 async def update_authority(
     authority_id: int,
     authority_update: schemas.AuthorityCreate,
@@ -1181,7 +1213,20 @@ async def update_authority(
     db.refresh(db_authority)
     return db_authority
 
+# Add PATCH method for partial updates
+@authorities_router.patch("/authorities/{authority_id}", response_model=schemas.Authority)
+@authorities_router.patch("/authorities/{authority_id}/", response_model=schemas.Authority)
+async def patch_authority(
+    authority_id: int,
+    authority_update: schemas.AuthorityCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_superadmin)
+):
+    # Reuse the same implementation as PUT
+    return await update_authority(authority_id, authority_update, db, current_user)
+
 @authorities_router.delete("/authorities/{authority_id}", status_code=status.HTTP_204_NO_CONTENT)
+@authorities_router.delete("/authorities/{authority_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_authority(
     authority_id: int,
     db: Session = Depends(get_db),
@@ -1230,6 +1275,7 @@ async def restore_authority(
     return db_authority
 
 # Status endpoints - Restored
+@statuses_router.post("/statuses", response_model=schemas.Status)
 @statuses_router.post("/statuses/", response_model=schemas.Status)
 async def create_status(
     status: schemas.StatusCreate,
@@ -1256,6 +1302,7 @@ async def create_status(
     return db_status
 
 # Update the read_statuses function to handle None current_user
+@statuses_router.get("/statuses", response_model=List[schemas.Status])
 @statuses_router.get("/statuses/", response_model=List[schemas.Status])
 async def read_statuses(
     include_deleted: bool = False,
@@ -1288,6 +1335,7 @@ async def read_status(
     return db_status
 
 @statuses_router.put("/statuses/{status_id}", response_model=schemas.Status)
+@statuses_router.put("/statuses/{status_id}/", response_model=schemas.Status)
 async def update_status(
     status_id: int,
     status_update: schemas.StatusCreate,
@@ -1317,7 +1365,20 @@ async def update_status(
     db.refresh(db_status)
     return db_status
 
+# Add PATCH method for partial updates
+@statuses_router.patch("/statuses/{status_id}", response_model=schemas.Status)
+@statuses_router.patch("/statuses/{status_id}/", response_model=schemas.Status)
+async def patch_status(
+    status_id: int,
+    status_update: schemas.StatusCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_superadmin)
+):
+    # Reuse the same implementation as PUT
+    return await update_status(status_id, status_update, db, current_user)
+
 @statuses_router.delete("/statuses/{status_id}", status_code=status.HTTP_204_NO_CONTENT)
+@statuses_router.delete("/statuses/{status_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_status(
     status_id: int,
     db: Session = Depends(get_db),

@@ -102,6 +102,8 @@ class Project(Base, SoftDeleteMixin):
     authority_id = Column(Integer, ForeignKey("authorities.id"))
     status_id = Column(Integer, ForeignKey("statuses.id"))
     general_status = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     
     # Relationships
     region = relationship("Region", back_populates="projects")

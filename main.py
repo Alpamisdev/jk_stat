@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, Query, Response, Re
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, desc, func
 from typing import List, Optional, Dict, Any
 from datetime import timedelta, datetime
 import io
@@ -73,47 +73,61 @@ async def handle_trailing_slash(request: Request, call_next):
         return await call_next(request)
     
     # For API endpoints, be more flexible with trailing slashes
-    # Instead of redirecting, try to match both with and without trailing slash
-    if path.endswith('/') and request.method in ['PUT', 'PATCH', 'DELETE', 'POST']:
-        # For these methods, try without trailing slash first
+    if path != "/" and path != "":  # Don't process root path
         original_path = path
-        request.scope["path"] = path.rstrip('/')
+        original_url = str(request.url)
+        
+        # Try both with and without trailing slash
+        try_paths = []
+        if path.endswith('/'):
+            try_paths = [path, path.rstrip('/')]
+        else:
+            try_paths = [path, f"{path}/"]
+        
+        # Try the original path first
         try:
             response = await call_next(request)
-            if response.status_code != 404:
+            if response.status_code != 404 and response.status_code != 405:
                 return response
-            # If 404, restore original path and continue
-            request.scope["path"] = original_path
         except Exception:
-            # If error, restore original path and continue
-            request.scope["path"] = original_path
+            pass
+        
+        # If we got a 404 or 405, try the alternative path
+        for try_path in try_paths:
+            if try_path != original_path:
+                # Modify the request path
+                request.scope["path"] = try_path
+                request.scope["raw_path"] = try_path.encode()
+                
+                # Update the full URL
+                if original_url.endswith('/') and not try_path.endswith('/'):
+                    request.scope["raw_path"] = original_url[:-1].encode()
+                elif not original_url.endswith('/') and try_path.endswith('/'):
+                    request.scope["raw_path"] = (original_url + '/').encode()
+                
+                try:
+                    response = await call_next(request)
+                    if response.status_code != 404 and response.status_code != 405:
+                        return response
+                    # Restore original path if we still get an error
+                    request.scope["path"] = original_path
+                    request.scope["raw_path"] = original_path.encode()
+                except Exception:
+                    # Restore original path if we get an exception
+                    request.scope["path"] = original_path
+                    request.scope["raw_path"] = original_path.encode()
     
-    # For paths without trailing slash, try with trailing slash for GET requests
-    elif not path.endswith('/') and request.method == 'GET':
-        # For GET, try with trailing slash first
-        original_path = path
-        request.scope["path"] = f"{path}/"
-        try:
-            response = await call_next(request)
-            if response.status_code != 404:
-                return response
-            # If 404, restore original path and continue
-            request.scope["path"] = original_path
-        except Exception:
-            # If error, restore original path and continue
-            request.scope["path"] = original_path
-    
-    # Continue with normal processing
+    # Continue with normal processing if all alternatives failed
     return await call_next(request)
 
 # Add CORS middleware
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["http://localhost:5173", "https://alpamis.space", "https://www.alpamis.space"],  # List specific origins instead of "*"
+  allow_origins=["http://localhost:5173", "http://localhost:5174", "https://admin-panel-qq-eco-social.netlify.app", "https://qq-ekonomika-social.netlify.app", "https://localhost:5173", "https://localhost:5174"],  # List specific origins instead of "*"
   allow_credentials=True,
   allow_methods=["*"],
   allow_headers=["*"],
-  expose_headers=["Authorization"],
+  expose_headers=["Authorization", "Content-Disposition"],
 )
 
 # Add RequestLoggingMiddleware
@@ -735,30 +749,104 @@ async def read_projects(
     projects = query.all()
     return projects
 
-# New endpoint for filtering projects
-@projects_router.get("/projects/filter", response_model=schemas.ProjectFilterResponse)
+# New endpoint to get the latest update timestamp across all projects
+@projects_router.get("/projects/last_update", response_model=dict)
+async def get_last_update_timestamp(
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(conditional_auth)
+):
+    """
+    Get the latest update timestamp across all projects.
+    Returns the most recent updated_at value from any project.
+    """
+    # Base query for non-deleted projects
+    query = db.query(func.max(models.Project.updated_at)).filter(
+        models.Project.deleted_at == None
+    )
+    
+    # Filter by user's accessible regions if not superadmin
+    if current_user is not None and not current_user.is_superadmin:
+        accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+        if not accessible_region_ids:
+            return {"last_update": None}  # Return None if user has no accessible regions
+        query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+    
+    # Get the latest update timestamp
+    latest_update = query.scalar()
+    
+    # Return the timestamp or None if no projects exist
+    return {
+        "last_update": latest_update
+    }
+
+# New endpoint to get the most recently updated projects
+@projects_router.get("/projects/last-updates", response_model=List[schemas.ProjectLastUpdate])
+async def get_last_project_updates(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(conditional_auth)
+):
+    """
+    Get the most recently updated projects across all regions.
+    Returns a list of projects sorted by update time (newest first).
+    """
+    # Base query for non-deleted projects
+    query = db.query(
+        models.Project.id.label("project_id"),
+        models.Project.name.label("project_name"),
+        models.Region.name.label("region_name"),
+        models.Project.updated_at
+    ).join(
+        models.Region, models.Project.region_id == models.Region.id
+    ).filter(
+        models.Project.deleted_at == None,
+        models.Region.deleted_at == None
+    )
+    
+    # Filter by user's accessible regions if not superadmin
+    if current_user is not None and not current_user.is_superadmin:
+        accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+        if not accessible_region_ids:
+            return []  # Return empty list if user has no accessible regions
+        query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+    
+    # Order by most recently updated and limit results
+    results = query.order_by(desc(models.Project.updated_at)).limit(limit).all()
+    
+    # Convert to list of ProjectLastUpdate objects
+    return [
+        schemas.ProjectLastUpdate(
+            project_id=result.project_id,
+            project_name=result.project_name,
+            region_name=result.region_name,
+            updated_at=result.updated_at
+        ) for result in results
+    ]
+
+# Find the filter_projects function and replace it with this improved version
+@projects_router.get("/projects/filter", response_model=List[schemas.Project])
 async def filter_projects(
     region_id: Optional[int] = None,
     budget_min: Optional[float] = None,
     budget_max: Optional[float] = None,
     status_id: Optional[int] = None,
-    initiator: Optional[str] = None,
-    name: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(conditional_auth)
 ):
-    # This GET endpoint doesn't require authentication
-    # Start with base query
+    """
+    Filter projects by region, budget range, and status.
+    All parameters are optional - if not provided, that filter will be ignored.
+    """
+    # Start with base query for non-deleted projects
     query = db.query(models.Project).filter(models.Project.deleted_at == None)
     
-    # Apply region filter and check access for authenticated users
+    # Apply region filter if provided and not None
     if region_id is not None:
         # For authenticated users, check region access
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if region_id not in accessible_region_ids:
                 # For authenticated users without access, return 403
-                # For unauthenticated users, just filter by the requested region
                 if current_user is not None:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
@@ -771,68 +859,31 @@ async def filter_projects(
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if not accessible_region_ids:
-                return {"total": 0, "items": []}  # Return empty result if user has no accessible regions
+                return []  # Return empty result if user has no accessible regions
             query = query.filter(models.Project.region_id.in_(accessible_region_ids))
     
-    # Apply budget filters
+    # Apply budget filters if provided and not None
     if budget_min is not None:
         query = query.filter(models.Project.budget_million >= budget_min)
+    
     if budget_max is not None:
         query = query.filter(models.Project.budget_million <= budget_max)
     
-    # Apply status filter
+    # Apply status filter if provided and not None
     if status_id is not None:
         query = query.filter(models.Project.status_id == status_id)
     
-    # Apply initiator (responsible person) filter
-    if initiator is not None:
-        query = query.filter(models.Project.initiator.ilike(f"%{initiator}%"))
-    
-    # Apply name filter
-    if name is not None:
-        query = query.filter(models.Project.name.ilike(f"%{name}%"))
-    
-    # Get total count
-    total = query.count()
-    
-    # Get all projects
-    projects = query.all()
-    
-    # Load related data
-    result_items = []
-    for project in projects:
-        project_dict = {
-            "id": project.id,
-            "region_id": project.region_id,
-            "initiator": project.initiator,
-            "name": project.name,
-            "budget_million": project.budget_million,
-            "jobs_created": project.jobs_created,
-            "completion_date": project.completion_date,
-            "authority_id": project.authority_id,
-            "status_id": project.status_id,
-            "general_status": project.general_status,
-            "deleted_at": project.deleted_at,
-            "region": {
-                "id": project.region.id,
-                "name": project.region.name,
-                "stat_code": project.region.stat_code,
-                "deleted_at": project.region.deleted_at
-            },
-            "authority": {
-                "id": project.authority.id,
-                "name": project.authority.name,
-                "deleted_at": project.authority.deleted_at
-            },
-            "status": {
-                "id": project.status.id,
-                "name": project.status.name,
-                "deleted_at": project.status.deleted_at
-            }
-        }
-        result_items.append(project_dict)
-    
-    return {"total": total, "items": result_items}
+    # Get all projects matching the filters
+    try:
+        projects = query.all()
+        return projects
+    except Exception as e:
+        # Log the error and return a more helpful error message
+        print(f"Error filtering projects: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Error filtering projects: {str(e)}"
+        )
 
 # New endpoint for exporting projects to Excel
 @projects_router.get("/projects/export")
@@ -856,7 +907,7 @@ async def export_projects_to_excel(
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if region_id not in accessible_region_ids:
-                # For authenticated users without access, return 403
+                # For authenticated users, return 403
                 # For unauthenticated users, just filter by the requested region
                 if current_user is not None:
                     raise HTTPException(
@@ -881,11 +932,24 @@ async def export_projects_to_excel(
                 
                 headers = {
                     'Content-Disposition': 'attachment; filename="projects.xlsx"',
-                    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'Access-Control-Expose-Headers': 'Content-Disposition'
                 }
                 return Response(content=output.getvalue(), headers=headers)
             
             query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+    
+    # Apply other filters
+    if budget_min is not None:
+        query = query.filter(models.Project.budget_million >= budget_min)
+    if budget_max is not None:
+        query = query.filter(models.Project.budget_million <= budget_max)
+    if status_id is not None:
+        query = query.filter(models.Project.status_id == status_id)
+    if initiator is not None:
+        query = query.filter(models.Project.initiator.ilike(f"%{initiator}%"))
+    if name is not None:
+        query = query.filter(models.Project.name.ilike(f"%{name}%"))
     
     # Get all projects with their related data
     projects = query.all()
@@ -898,7 +962,8 @@ async def export_projects_to_excel(
     # Define headers
     headers = [
         "ID", "Region", "Initiator", "Name", "Budget (Million)", 
-        "Jobs Created", "Completion Date", "Authority", "Status", "General Status"
+        "Jobs Created", "Completion Date", "Authority", "Status", 
+        "General Status", "Last Updated"
     ]
     
     # Add headers with styling
@@ -923,6 +988,7 @@ async def export_projects_to_excel(
         ws.cell(row=row_num, column=8, value=project.authority.name)
         ws.cell(row=row_num, column=9, value=project.status.name)
         ws.cell(row=row_num, column=10, value=project.general_status)
+        ws.cell(row=row_num, column=11, value=project.updated_at.isoformat() if project.updated_at else None)
     
     # Auto-adjust column widths
     for col_num, _ in enumerate(headers, 1):
@@ -935,10 +1001,11 @@ async def export_projects_to_excel(
     wb.save(output)
     output.seek(0)
     
-    # Return Excel file
+    # Return Excel file with appropriate headers for direct download
     headers = {
         'Content-Disposition': 'attachment; filename="projects.xlsx"',
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Access-Control-Expose-Headers': 'Content-Disposition'
     }
     return Response(content=output.getvalue(), headers=headers)
 
@@ -1054,6 +1121,8 @@ async def update_project(
     
     if project_update.general_status is not None:
         project.general_status = project_update.general_status
+    
+    # updated_at will be automatically updated by SQLAlchemy
     
     db.commit()
     db.refresh(project)
@@ -1472,4 +1541,3 @@ app.openapi = custom_openapi
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-

@@ -106,6 +106,8 @@ class ProjectUpdate(BaseModel):
 class Project(ProjectBase):
     id: int
     deleted_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -116,7 +118,16 @@ class ProjectDetail(Project):
     
     model_config = ConfigDict(from_attributes=True)
 
-# New schema for project filtering response
+# New schema for last update information
+class ProjectLastUpdate(BaseModel):
+    project_id: int
+    project_name: str
+    region_name: str
+    updated_at: datetime
+  
+    model_config = ConfigDict(from_attributes=True)
+
+# New schema for project filtering response with updated_at
 class ProjectFilterResponse(BaseModel):
     total: int
     items: List[Dict[str, Any]]

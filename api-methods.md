@@ -23,6 +23,10 @@ The API supports the following HTTP methods for each resource:
 ### Projects
 - `GET /projects` - List all projects (public)
 - `GET /projects/{project_id}` - Get a specific project (public)
+- `GET /projects/last-updates` - Get most recently updated projects (public)
+- `GET /projects/last_update` - Get the latest update timestamp across all projects (public)
+- `GET /projects/filter` - Filter projects with various criteria (public)
+- `GET /projects/export` - Export projects to Excel file (public)
 - `POST /projects` - Create a new project (requires authentication and region access)
 - `PUT /projects/{project_id}` - Update a project (requires authentication and region access)
 - `PATCH /projects/{project_id}` - Partially update a project (requires authentication and region access)
@@ -78,4 +82,16 @@ The API returns appropriate HTTP status codes:
 - Request bodies should use `application/json`
 - Responses are returned as `application/json`
 - The `/projects/export` endpoint returns `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+
+## Project Update Tracking
+
+All projects now include:
+- `created_at` - When the project was created
+- `updated_at` - When the project was last updated
+
+The API provides two endpoints for tracking updates:
+1. `/projects/last-updates` - Returns a list of recently updated projects with details
+2. `/projects/last_update` - Returns just the latest update timestamp across all projects
+
+These endpoints allow you to efficiently track changes and determine when the most recent update occurred.
 

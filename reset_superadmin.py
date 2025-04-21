@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import engine, SessionLocal
-from models import User
+from models import User, Region
 from auth import get_password_hash
 
 load_dotenv()
@@ -35,6 +35,16 @@ def reset_superadmin_password():
             
             if result.rowcount > 0:
                 print(f"Superadmin password reset successfully to '{new_password}'")
+                
+                # Get the superadmin user
+                superadmin = db.query(User).filter(User.username == 'superadmin').first()
+                
+                # Assign all regions to the superadmin
+                all_regions = db.query(Region).filter(Region.deleted_at == None).all()
+                superadmin.regions = all_regions
+                db.commit()
+                
+                print(f"Assigned {len(all_regions)} regions to superadmin")
             else:
                 print("No superadmin user found. Creating one...")
                 # Create a new superadmin user
@@ -47,7 +57,14 @@ def reset_superadmin_password():
                 )
                 db.add(superadmin)
                 db.commit()
+                
+                # Assign all regions to the superadmin
+                all_regions = db.query(Region).filter(Region.deleted_at == None).all()
+                superadmin.regions = all_regions
+                db.commit()
+                
                 print(f"Superadmin created with password '{new_password}'")
+                print(f"Assigned {len(all_regions)} regions to superadmin")
     
     except Exception as e:
         print(f"Error resetting superadmin password: {e}")
@@ -57,4 +74,3 @@ def reset_superadmin_password():
 
 if __name__ == "__main__":
     reset_superadmin_password()
-

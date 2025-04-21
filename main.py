@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 import logging
 from pydantic import BaseModel
+import secrets
 
 import models
 import schemas
@@ -123,11 +124,11 @@ async def handle_trailing_slash(request: Request, call_next):
 # Add CORS middleware
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["http://localhost:5173", "https://alpamis.space", "https://www.alpamis.space"],  # List specific origins instead of "*"
+  allow_origins=["http://localhost:5173", "http://localhost:5174", "https://admin-panel-qq-eco-social.netlify.app", "https://qq-ekonomika-social.netlify.app", "https://localhost:5173", "https://localhost:5174"],  # List specific origins instead of "*"
   allow_credentials=True,
   allow_methods=["*"],
   allow_headers=["*"],
-  expose_headers=["Authorization", "Content-Disposition", "Content-Type", "Content-Length"],
+  expose_headers=["Authorization", "Content-Disposition"],
 )
 
 # Add RequestLoggingMiddleware
@@ -203,6 +204,134 @@ async def login_for_access_token(
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+# Password reset endpoints
+@auth_router.post("/request-password-reset", tags=["Authentication"])
+async def request_password_reset(
+    username: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Request a password reset token for a user.
+    This endpoint is public and does not require authentication.
+    """
+    # Find the user
+    user = db.query(models.User).filter(
+        models.User.username == username,
+        models.User.deleted_at == None,
+        models.User.is_active == True
+    ).first()
+    
+    if not user:
+        # For security reasons, don't reveal if the user exists or not
+        return {"message": "If the user exists, a reset token has been sent"}
+    
+    # Generate a secure token
+    token = secrets.token_urlsafe(32)
+    
+    # Calculate expiration (24 hours from now)
+    expiration = datetime.utcnow() + timedelta(hours=24)
+    expiration_str = expiration.isoformat()
+    
+    # Store the token in the database
+    # Check if the reset_tokens table exists, create it if not
+    with engine.connect() as connection:
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used BOOLEAN DEFAULT FALSE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """))
+        
+        # Insert the new token
+        connection.execute(
+            text("INSERT INTO reset_tokens (user_id, token, expires_at) VALUES (:user_id, :token, :expires_at)"),
+            {"user_id": user.id, "token": token, "expires_at": expiration_str}
+        )
+        connection.commit()
+    
+    # In a real application, you would send this token to the user via email
+    # For this example, we just return it in the response
+    # NOTE: In production, NEVER return the token directly in the API response
+    
+    return {
+        "message": "If the user exists, a reset token has been sent",
+        "debug_info": {
+            "token": token,  # Remove this in production!
+            "expires_at": expiration_str
+        }
+    }
+
+@auth_router.post("/reset-password", tags=["Authentication"])
+async def reset_password(
+    token: str,
+    new_password: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Reset a user's password using a valid token.
+    This endpoint is public and does not require authentication.
+    """
+    try:
+        # Find the token in the database
+        with engine.connect() as connection:
+            result = connection.execute(
+                text("""
+                    SELECT rt.id, rt.user_id, rt.expires_at, rt.used, u.username 
+                    FROM reset_tokens rt
+                    JOIN users u ON rt.user_id = u.id
+                    WHERE rt.token = :token AND rt.used = FALSE
+                """),
+                {"token": token}
+            ).fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid or already used token"
+                )
+            
+            token_id, user_id, expires_at, used, username = result
+            
+            # Check if token is expired
+            expiration = datetime.fromisoformat(expires_at)
+            if datetime.utcnow() > expiration:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Token has expired"
+                )
+            
+            # Hash the new password
+            hashed_password = get_password_hash(new_password)
+            
+            # Update the user's password
+            connection.execute(
+                text("UPDATE users SET password_hash = :hash WHERE id = :user_id"),
+                {"hash": hashed_password, "user_id": user_id}
+            )
+            
+            # Mark the token as used
+            connection.execute(
+                text("UPDATE reset_tokens SET used = TRUE WHERE id = :token_id"),
+                {"token_id": token_id}
+            )
+            
+            connection.commit()
+            
+            return {"message": "Password reset successfully"}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error resetting password: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error resetting password"
+        )
+
 # User management endpoints (superadmin only)
 @users_router.post("/users", response_model=schemas.User)
 @users_router.post("/users/", response_model=schemas.User)
@@ -243,8 +372,12 @@ async def create_user(
         db.add(db_user)
         db.commit()  # Commit to get the user ID
     
-    # Assign regions for non-superadmin users
-    if not user.is_superadmin and user.region_ids:
+    # If superadmin, assign all regions automatically
+    if user.is_superadmin:
+        all_regions = db.query(models.Region).filter(models.Region.deleted_at == None).all()
+        db_user.regions = all_regions
+    # Otherwise, assign regions for non-superadmin users if specified
+    elif user.region_ids:
         # Verify all region IDs exist and are not deleted
         regions = []
         for region_id in user.region_ids:
@@ -878,7 +1011,7 @@ async def filter_projects(
         if current_user is not None and not current_user.is_superadmin:
             accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
             if region_id not in accessible_region_ids:
-                # For authenticated users without access, return 403
+                # For authenticated users, return 403
                 if current_user is not None:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,

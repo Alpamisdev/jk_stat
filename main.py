@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, Query, Response, Re
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, desc, func
+from sqlalchemy import or_, and_, desc, func, inspect, text
 from typing import List, Optional, Dict, Any
 from datetime import timedelta, datetime
 import io
@@ -123,11 +123,11 @@ async def handle_trailing_slash(request: Request, call_next):
 # Add CORS middleware
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["http://localhost:5173", "http://localhost:5174", "https://admin-panel-qq-eco-social.netlify.app", "https://qq-ekonomika-social.netlify.app", "https://localhost:5173", "https://localhost:5174"],  # List specific origins instead of "*"
+  allow_origins=["http://localhost:5173", "https://alpamis.space", "https://www.alpamis.space"],  # List specific origins instead of "*"
   allow_credentials=True,
   allow_methods=["*"],
   allow_headers=["*"],
-  expose_headers=["Authorization", "Content-Disposition"],
+  expose_headers=["Authorization", "Content-Disposition", "Content-Type", "Content-Length"],
 )
 
 # Add RequestLoggingMiddleware
@@ -759,25 +759,44 @@ async def get_last_update_timestamp(
     Get the latest update timestamp across all projects.
     Returns the most recent updated_at value from any project.
     """
-    # Base query for non-deleted projects
-    query = db.query(func.max(models.Project.updated_at)).filter(
-        models.Project.deleted_at == None
-    )
-    
-    # Filter by user's accessible regions if not superadmin
-    if current_user is not None and not current_user.is_superadmin:
-        accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
-        if not accessible_region_ids:
-            return {"last_update": None}  # Return None if user has no accessible regions
-        query = query.filter(models.Project.region_id.in_(accessible_region_ids))
-    
-    # Get the latest update timestamp
-    latest_update = query.scalar()
-    
-    # Return the timestamp or None if no projects exist
-    return {
-        "last_update": latest_update
-    }
+    try:
+        # Check if updated_at column exists
+        inspector = inspect(engine)
+        columns = [column['name'] for column in inspector.get_columns('projects')]
+        
+        if 'updated_at' not in columns:
+            # If updated_at doesn't exist, return current timestamp
+            return {
+                "last_update": datetime.utcnow().isoformat(),
+                "note": "updated_at column not found in database, using current time"
+            }
+        
+        # Base query for non-deleted projects
+        query = db.query(func.max(models.Project.updated_at)).filter(
+            models.Project.deleted_at == None
+        )
+        
+        # Filter by user's accessible regions if not superadmin
+        if current_user is not None and not current_user.is_superadmin:
+            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+            if not accessible_region_ids:
+                return {"last_update": None}  # Return None if user has no accessible regions
+            query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+        
+        # Get the latest update timestamp
+        latest_update = query.scalar()
+        
+        # Return the timestamp or None if no projects exist
+        return {
+            "last_update": latest_update
+        }
+    except Exception as e:
+        print(f"Error getting last update timestamp: {str(e)}")
+        # Return current time as fallback
+        return {
+            "last_update": datetime.utcnow().isoformat(),
+            "error": str(e)
+        }
 
 # New endpoint to get the most recently updated projects
 @projects_router.get("/projects/last-updates", response_model=List[schemas.ProjectLastUpdate])
@@ -790,38 +809,51 @@ async def get_last_project_updates(
     Get the most recently updated projects across all regions.
     Returns a list of projects sorted by update time (newest first).
     """
-    # Base query for non-deleted projects
-    query = db.query(
-        models.Project.id.label("project_id"),
-        models.Project.name.label("project_name"),
-        models.Region.name.label("region_name"),
-        models.Project.updated_at
-    ).join(
-        models.Region, models.Project.region_id == models.Region.id
-    ).filter(
-        models.Project.deleted_at == None,
-        models.Region.deleted_at == None
-    )
-    
-    # Filter by user's accessible regions if not superadmin
-    if current_user is not None and not current_user.is_superadmin:
-        accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
-        if not accessible_region_ids:
-            return []  # Return empty list if user has no accessible regions
-        query = query.filter(models.Project.region_id.in_(accessible_region_ids))
-    
-    # Order by most recently updated and limit results
-    results = query.order_by(desc(models.Project.updated_at)).limit(limit).all()
-    
-    # Convert to list of ProjectLastUpdate objects
-    return [
-        schemas.ProjectLastUpdate(
-            project_id=result.project_id,
-            project_name=result.project_name,
-            region_name=result.region_name,
-            updated_at=result.updated_at
-        ) for result in results
-    ]
+    try:
+        # Check if updated_at column exists
+        inspector = inspect(engine)
+        columns = [column['name'] for column in inspector.get_columns('projects')]
+        
+        if 'updated_at' not in columns:
+            # If updated_at doesn't exist, return empty list with warning
+            print("Warning: updated_at column not found in database")
+            return []
+        
+        # Base query for non-deleted projects
+        query = db.query(
+            models.Project.id.label("project_id"),
+            models.Project.name.label("project_name"),
+            models.Region.name.label("region_name"),
+            models.Project.updated_at
+        ).join(
+            models.Region, models.Project.region_id == models.Region.id
+        ).filter(
+            models.Project.deleted_at == None,
+            models.Region.deleted_at == None
+        )
+        
+        # Filter by user's accessible regions if not superadmin
+        if current_user is not None and not current_user.is_superadmin:
+            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+            if not accessible_region_ids:
+                return []  # Return empty list if user has no accessible regions
+            query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+        
+        # Order by most recently updated and limit results
+        results = query.order_by(desc(models.Project.updated_at)).limit(limit).all()
+        
+        # Convert to list of ProjectLastUpdate objects
+        return [
+            schemas.ProjectLastUpdate(
+                project_id=result.project_id,
+                project_name=result.project_name,
+                region_name=result.region_name,
+                updated_at=result.updated_at
+            ) for result in results
+        ]
+    except Exception as e:
+        print(f"Error getting last project updates: {str(e)}")
+        return []
 
 # Find the filter_projects function and replace it with this improved version
 @projects_router.get("/projects/filter", response_model=List[schemas.Project])
@@ -897,117 +929,217 @@ async def export_projects_to_excel(
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(conditional_auth)
 ):
-    # This GET endpoint doesn't require authentication
-    # Start with base query
-    query = db.query(models.Project).filter(models.Project.deleted_at == None)
-    
-    # Apply region filter and check access for authenticated users
-    if region_id is not None:
-        # For authenticated users, check region access
-        if current_user is not None and not current_user.is_superadmin:
-            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
-            if region_id not in accessible_region_ids:
-                # For authenticated users, return 403
-                # For unauthenticated users, just filter by the requested region
-                if current_user is not None:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Not authorized to export projects in this region"
+    """
+    Export projects to Excel file.
+    If no parameters are provided, exports all projects.
+    Optimized for large datasets with batched processing.
+    """
+    try:
+        # First, check if the required columns exist in the database
+        inspector = inspect(engine)
+        if 'projects' not in inspector.get_table_names():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Projects table does not exist in the database"
+            )
+        
+        # Get existing columns in the projects table
+        existing_columns = {column['name'] for column in inspector.get_columns('projects')}
+        print(f"Existing columns in projects table: {existing_columns}")
+        
+        # Check for required columns and add them if missing
+        required_columns = ['created_at', 'updated_at']
+        missing_columns = [col for col in required_columns if col not in existing_columns]
+        
+        if missing_columns:
+            print(f"Missing columns detected: {missing_columns}")
+            # Add missing columns to the database
+            with engine.connect() as connection:
+                for column in missing_columns:
+                    print(f"Adding {column} column to projects table")
+                    connection.execute(
+                        text(f"ALTER TABLE projects ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
                     )
-        query = query.filter(models.Project.region_id == region_id)
-    else:
-        # If no region specified and user is authenticated but not superadmin,
-        # only show projects from regions they have access to
-        if current_user is not None and not current_user.is_superadmin:
-            accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
-            if not accessible_region_ids:
-                # Create empty Excel file
-                wb = openpyxl.Workbook()
-                ws = wb.active
-                ws.title = "Projects"
-                
-                output = io.BytesIO()
-                wb.save(output)
-                output.seek(0)
-                
-                headers = {
-                    'Content-Disposition': 'attachment; filename="projects.xlsx"',
-                    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    'Access-Control-Expose-Headers': 'Content-Disposition'
-                }
-                return Response(content=output.getvalue(), headers=headers)
+                connection.commit()
             
-            query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+            print("Columns added successfully")
+        
+        # Start with base query for non-deleted projects
+        query = db.query(models.Project).filter(models.Project.deleted_at == None)
+        
+        # Apply region filter and check access for authenticated users
+        if region_id is not None:
+            # For authenticated users, check region access
+            if current_user is not None and not current_user.is_superadmin:
+                accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+                if region_id not in accessible_region_ids:
+                    # For authenticated users, return 403
+                    # For unauthenticated users, just filter by the requested region
+                    if current_user is not None:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Not authorized to export projects in this region"
+                        )
+            query = query.filter(models.Project.region_id == region_id)
+        else:
+            # If no region specified and user is authenticated but not superadmin,
+            # only show projects from regions they have access to
+            if current_user is not None and not current_user.is_superadmin:
+                accessible_region_ids = [region.id for region in current_user.regions if region.deleted_at is None]
+                if not accessible_region_ids:
+                    # Create empty Excel file
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Projects"
+                    
+                    output = io.BytesIO()
+                    wb.save(output)
+                    output.seek(0)
+                    
+                    return Response(
+                        content=output.getvalue(),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={
+                            "Content-Disposition": "attachment; filename=projects.xlsx",
+                            "Access-Control-Expose-Headers": "Content-Disposition, Content-Type, Content-Length"
+                        }
+                    )
+                
+                query = query.filter(models.Project.region_id.in_(accessible_region_ids))
+        
+        # Apply other filters
+        if budget_min is not None:
+            query = query.filter(models.Project.budget_million >= budget_min)
+        if budget_max is not None:
+            query = query.filter(models.Project.budget_million <= budget_max)
+        if status_id is not None:
+            query = query.filter(models.Project.status_id == status_id)
+        if initiator is not None:
+            query = query.filter(models.Project.initiator.ilike(f"%{initiator}%"))
+        if name is not None:
+            query = query.filter(models.Project.name.ilike(f"%{name}%"))
+        
+        # Create Excel workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Projects"
+        
+        # Define headers
+        headers = [
+            "ID", "Region", "Initiator", "Name", "Budget (Million)", 
+            "Jobs Created", "Completion Date", "Authority", "Status", 
+            "General Status", "Created At", "Last Updated"
+        ]
+        
+        # Add headers with styling
+        header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+        header_font = Font(bold=True)
+        
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center')
+        
+        # Process projects in batches to optimize memory usage
+        BATCH_SIZE = 100
+        row_num = 2  # Start from row 2 (after headers)
+        
+        # Count total projects for progress reporting
+        total_projects = query.count()
+        print(f"Exporting {total_projects} projects")
+        
+        # Process in batches
+        for offset in range(0, total_projects, BATCH_SIZE):
+            batch = query.order_by(models.Project.id).offset(offset).limit(BATCH_SIZE).all()
+            
+            for project in batch:
+                try:
+                    # Safely get related data with error handling
+                    region_name = project.region.name if hasattr(project, 'region') and project.region else "Unknown"
+                    authority_name = project.authority.name if hasattr(project, 'authority') and project.authority else "Unknown"
+                    status_name = project.status.name if hasattr(project, 'status') and project.status else "Unknown"
+                    
+                    # Add data to cells with error handling for each field
+                    ws.cell(row=row_num, column=1, value=project.id)
+                    ws.cell(row=row_num, column=2, value=region_name)
+                    ws.cell(row=row_num, column=3, value=project.initiator)
+                    ws.cell(row=row_num, column=4, value=project.name)
+                    ws.cell(row=row_num, column=5, value=project.budget_million)
+                    ws.cell(row=row_num, column=6, value=project.jobs_created)
+                    
+                    # Handle date formatting safely
+                    if hasattr(project, 'completion_date') and project.completion_date:
+                        try:
+                            ws.cell(row=row_num, column=7, value=project.completion_date.isoformat())
+                        except:
+                            ws.cell(row=row_num, column=7, value=str(project.completion_date))
+                    else:
+                        ws.cell(row=row_num, column=7, value="")
+                    
+                    ws.cell(row=row_num, column=8, value=authority_name)
+                    ws.cell(row=row_num, column=9, value=status_name)
+                    ws.cell(row=row_num, column=10, value=project.general_status if hasattr(project, 'general_status') else "")
+                    
+                    # Handle created_at timestamp
+                    if hasattr(project, 'created_at') and project.created_at:
+                        try:
+                            ws.cell(row=row_num, column=11, value=project.created_at.isoformat())
+                        except:
+                            ws.cell(row=row_num, column=11, value=str(project.created_at))
+                    else:
+                        ws.cell(row=row_num, column=11, value="")
+                    
+                    # Handle updated_at timestamp
+                    if hasattr(project, 'updated_at') and project.updated_at:
+                        try:
+                            ws.cell(row=row_num, column=12, value=project.updated_at.isoformat())
+                        except:
+                            ws.cell(row=row_num, column=12, value=str(project.updated_at))
+                    else:
+                        ws.cell(row=row_num, column=12, value="")
+                        
+                    row_num += 1
+                except Exception as e:
+                    # Log the error but continue with other rows
+                    print(f"Error adding row {row_num} to Excel: {str(e)}")
+                    continue
+            
+            # Report progress
+            print(f"Processed {min(offset + BATCH_SIZE, total_projects)} of {total_projects} projects")
+        
+        # Auto-adjust column widths
+        for col_num, _ in enumerate(headers, 1):
+            column_letter = get_column_letter(col_num)
+            # Set a minimum width
+            ws.column_dimensions[column_letter].width = 15
+        
+        # Save to BytesIO
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        # Generate a timestamp for the filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"projects_export_{timestamp}.xlsx"
+        
+        # Return Excel file with appropriate headers for direct download
+        return Response(
+            content=output.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Type, Content-Length"
+            }
+        )
     
-    # Apply other filters
-    if budget_min is not None:
-        query = query.filter(models.Project.budget_million >= budget_min)
-    if budget_max is not None:
-        query = query.filter(models.Project.budget_million <= budget_max)
-    if status_id is not None:
-        query = query.filter(models.Project.status_id == status_id)
-    if initiator is not None:
-        query = query.filter(models.Project.initiator.ilike(f"%{initiator}%"))
-    if name is not None:
-        query = query.filter(models.Project.name.ilike(f"%{name}%"))
-    
-    # Get all projects with their related data
-    projects = query.all()
-    
-    # Create Excel workbook
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Projects"
-    
-    # Define headers
-    headers = [
-        "ID", "Region", "Initiator", "Name", "Budget (Million)", 
-        "Jobs Created", "Completion Date", "Authority", "Status", 
-        "General Status", "Last Updated"
-    ]
-    
-    # Add headers with styling
-    header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
-    header_font = Font(bold=True)
-    
-    for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal='center')
-    
-    # Add data
-    for row_num, project in enumerate(projects, 2):
-        ws.cell(row=row_num, column=1, value=project.id)
-        ws.cell(row=row_num, column=2, value=project.region.name)
-        ws.cell(row=row_num, column=3, value=project.initiator)
-        ws.cell(row=row_num, column=4, value=project.name)
-        ws.cell(row=row_num, column=5, value=project.budget_million)
-        ws.cell(row=row_num, column=6, value=project.jobs_created)
-        ws.cell(row=row_num, column=7, value=project.completion_date.isoformat() if project.completion_date else None)
-        ws.cell(row=row_num, column=8, value=project.authority.name)
-        ws.cell(row=row_num, column=9, value=project.status.name)
-        ws.cell(row=row_num, column=10, value=project.general_status)
-        ws.cell(row=row_num, column=11, value=project.updated_at.isoformat() if project.updated_at else None)
-    
-    # Auto-adjust column widths
-    for col_num, _ in enumerate(headers, 1):
-        column_letter = get_column_letter(col_num)
-        # Set a minimum width
-        ws.column_dimensions[column_letter].width = 15
-    
-    # Save to BytesIO
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    
-    # Return Excel file with appropriate headers for direct download
-    headers = {
-        'Content-Disposition': 'attachment; filename="projects.xlsx"',
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Access-Control-Expose-Headers': 'Content-Disposition'
-    }
-    return Response(content=output.getvalue(), headers=headers)
+    except Exception as e:
+        # Log the error and return a helpful error message
+        print(f"Error generating Excel file: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating Excel file: {str(e)}"
+        )
 
 # Update the read_project function to handle None current_user
 @projects_router.get("/projects/{project_id}", response_model=schemas.ProjectDetail)
